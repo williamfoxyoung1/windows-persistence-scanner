@@ -510,14 +510,6 @@ Always validate findings before modifying or removing system components.
 
 ---
 
-## License
-
-Add the license selected for the project here.
-
-For an open-source project, the MIT License is one commonly used option.
-
----
-
 ## Author
 
 Developed as a Python cybersecurity project focused on Windows persistence enumeration, security auditing, and defensive analysis.
