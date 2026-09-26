@@ -1,482 +1,485 @@
 # Windows Persistence Scanner
 
-A Python-based Windows security auditing tool designed to identify common **persistence and autostart mechanisms** on Windows systems.
+A Python-based Windows security auditing and threat-hunting tool that identifies common Windows autostart and persistence mechanisms and analyzes them using **conservative risk-based heuristics**.
 
-Windows Persistence Scanner enumerates startup locations, Registry entries, scheduled tasks, and Windows services, then analyzes discovered executables using file existence checks, publisher information, SHA-256 hashing, and security-focused heuristics.
+The scanner enumerates Startup folders, Registry Run keys, Scheduled Tasks, and automatic Windows Services while collecting information such as executable paths, Authenticode publishers, digital signature status, and SHA-256 hashes.
 
-The tool is **read-only** and does not disable, delete, or modify discovered persistence mechanisms.
+Rather than treating every unusual characteristic as malicious, the scanner uses a **weighted risk-scoring system** designed to reduce false positives and prioritize entries that deserve further investigation.
 
 ---
 
 ## Features
 
-- Scans the **Current User Startup folder**
-- Scans the **All Users Startup folder**
-- Enumerates `HKCU` Registry `Run` and `RunOnce` entries
-- Enumerates `HKLM` Registry `Run` and `RunOnce` entries
-- Checks both **32-bit and 64-bit Registry views**
-- Enumerates **Windows Scheduled Tasks**
-- Enumerates **Windows Services**
-- Identifies whether an entry applies to the **Current User** or **System / All Users**
-- Extracts executable paths from startup commands
-- Resolves Windows `.lnk` shortcuts
-- Checks whether referenced files exist
-- Retrieves Authenticode publisher/signature information
-- Calculates **SHA-256 hashes**
-- Detects potentially suspicious startup characteristics
-- Assigns **HIGH, MEDIUM, LOW, or CLEAN** review levels
-- Displays color-coded results directly in the console
-- Provides detailed information for flagged entries
+### Persistence Discovery
 
----
+The scanner examines several common Windows persistence and autostart locations:
 
-## Screenshot
+- Current User Startup Folder
+- All Users Startup Folder
+- HKCU `Run`
+- HKCU `RunOnce`
+- HKLM `Run`
+- HKLM `RunOnce`
+- 32-bit and 64-bit HKLM Registry views
+- Scheduled Tasks with executable actions
+- Automatic Windows Services
 
+Each entry is labeled according to its scope:
 
-![Windows Persistence Scanner](screenshots/windows-persistence-scanner-results.png)
-
-
----
-
-## Persistence Locations
-
-The scanner currently examines the following Windows autostart and persistence mechanisms.
-
-### Startup Folders
-
-**Current User**
-
-```text
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-```
-
-**All Users**
-
-```text
-%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs\StartUp
-```
-
-### Registry
-
-Current-user startup entries:
-
-```text
-HKCU\Software\Microsoft\Windows\CurrentVersion\Run
-
-HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce
-```
-
-System-wide startup entries:
-
-```text
-HKLM\Software\Microsoft\Windows\CurrentVersion\Run
-
-HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce
-```
-
-Both 32-bit and 64-bit Registry views are examined where applicable.
-
-### Scheduled Tasks
-
-The scanner enumerates Windows Scheduled Tasks and collects information including:
-
-- Task name
-- Task path
-- Executable
-- Arguments
-- User
-- State
-- Run level
-
-### Windows Services
-
-Windows services are examined for information including:
-
-- Service name
-- Display name
-- Startup mode
-- Current state
-- Service account
-- Executable path
+- **Current User**
+- **All Users**
+- **System / All Users**
 
 ---
 
 ## Security Analysis
 
-For each discovered entry, Windows Persistence Scanner attempts to collect:
+For discovered entries, the scanner can collect:
 
-| Field | Description |
-|---|---|
-| **Name** | Name of the startup entry, task, or service |
-| **Scope** | Current User or System / All Users |
-| **Startup Type** | Persistence mechanism responsible for execution |
-| **Command** | Full startup command |
-| **Executable Path** | Extracted executable or script path |
-| **Exists** | Whether the referenced file currently exists |
-| **Publisher** | Authenticode signer/publisher information |
-| **SHA-256** | SHA-256 cryptographic hash of the file |
-| **Flags** | Security heuristics triggered by the entry |
+- Persistence entry name
+- User/system scope
+- Startup mechanism
+- Original command
+- Command arguments
+- Launcher executable
+- Explicit target or payload when confidently identifiable
+- File existence
+- Authenticode publisher
+- Authenticode signature status
+- SHA-256 hash
+- Heuristic flags
+- Risk score
+- Severity
 
----
+This makes the tool useful for:
 
-## Risk Highlighting
-
-Results are color-coded to make unusual entries easier to identify.
-
-### HIGH — Red
-
-High-priority indicators currently include:
-
-```text
-TEMP_PATH
-DOWNLOADS_PATH
-ENCODED_COMMAND
-HIDDEN_WINDOW
-```
-
-Examples include an executable launching directly from a temporary directory or a PowerShell command using encoded arguments.
-
-### MEDIUM — Yellow
-
-Medium-priority indicators include:
-
-```text
-MISSING_FILE
-NETWORK_PATH
-INTERPRETER
-SCRIPT
-```
-
-These entries may require additional investigation but are not necessarily malicious.
-
-### LOW — Magenta
-
-Lower-priority indicators include:
-
-```text
-APPDATA
-LOCAL_APPDATA
-UNSIGNED
-```
-
-These are relatively weak indicators on their own. Many legitimate applications install components in AppData or use unsigned executables.
-
-### CLEAN — Green
-
-Green means none of the scanner's currently implemented heuristics were triggered.
-
-**CLEAN does not guarantee that an entry is safe.**
+- Windows security auditing
+- Threat hunting
+- Incident-response triage
+- Persistence analysis
+- Blue-team training
+- Digital forensics
+- Cybersecurity labs
 
 ---
 
-## Important Note About Flags
+## Conservative Risk Scoring
 
-A flagged entry does **not** mean that malware has been detected.
+The scanner intentionally uses a conservative scoring model.
 
-The scanner uses security heuristics to identify entries that may deserve additional investigation.
+A flag does **not** mean that a file is malware.
+
+Instead, flags represent characteristics that may be useful during an investigation. Weak characteristics receive small scores, while stronger behaviors receive significantly larger scores.
+
+### Severity Levels
+
+| Severity | Score | Meaning |
+|---|---:|---|
+| CLEAN | 0 | No configured heuristic flags triggered |
+| LOW | 1–2 | Minor characteristics worth noting |
+| MEDIUM | 3–5 | Entry warrants additional review |
+| HIGH | 6+ | Strong or combined indicators warrant closer investigation |
+
+`CLEAN` should not be interpreted as a guarantee that an entry is safe. It means only that the entry did not trigger the scanner's configured heuristics.
+
+---
+
+## Heuristic Flags
+
+### Strong Indicators
+
+These indicators contribute heavily to the risk score:
+
+| Flag | Score | Description |
+|---|---:|---|
+| `TEMP_PATH` | +5 | Persistence executes from a temporary directory |
+| `DOWNLOADS_PATH` | +5 | Persistence executes from the user's Downloads directory |
+| `ENCODED_COMMAND` | +5 | PowerShell uses an encoded command |
+| `HIDDEN_WINDOW` | +4 | PowerShell requests hidden-window execution |
+
+### Moderate Indicators
+
+| Flag | Score | Description |
+|---|---:|---|
+| `NETWORK_PATH` | +3 | Execution occurs from a UNC/network path |
+| `SYSTEM_USER_WRITABLE` | +3 | System-level persistence points to a user-writable location |
+| `MISSING_FILE` | +2 | An explicitly referenced path cannot be found |
+| `MSHTA` | +2 | Persistence invokes `mshta.exe` |
+
+### Weak Indicators
+
+These are primarily contextual. They generally do not produce a high-priority result by themselves.
+
+| Flag | Score |
+|---|---:|
+| `POWERSHELL` | +1 |
+| `CMD` | +1 |
+| `RUNDLL32` | +1 |
+| `REGSVR32` | +1 |
+| `WSCRIPT` | +1 |
+| `CSCRIPT` | +1 |
+| `SCRIPT` | +1 |
+| `APPDATA` | +1 |
+| `LOCAL_APPDATA` | +1 |
+| `UNSIGNED` | +1 |
+
+This distinction helps prevent legitimate Windows components from being unnecessarily classified as suspicious.
+
+---
+
+## False-Positive Reduction
+
+Windows legitimately uses tools such as:
+
+- `powershell.exe`
+- `cmd.exe`
+- `rundll32.exe`
+- `regsvr32.exe`
+- `wscript.exe`
+- `cscript.exe`
+
+The presence of one of these programs is therefore not sufficient evidence of malicious activity.
+
+The scanner preserves these observations as weak indicators while emphasizing stronger combinations of behavior.
 
 For example:
 
 ```text
-APPDATA
+RUNDLL32
+Microsoft-signed DLL
+System32 location
+
+Score: 0–1
+Result: CLEAN / LOW
 ```
 
-may be completely legitimate because many applications execute from a user's AppData directory.
-
-However, a combination such as:
+A more unusual entry could produce:
 
 ```text
-Scheduled Task
-        ↓
-PowerShell
-        ↓
-Hidden Window
-        ↓
-Encoded Command
-        ↓
-Executable or script in %TEMP%
+POWERSHELL       +1
+SCRIPT           +1
+APPDATA          +1
+UNSIGNED         +1
+--------------------
+Risk Score        4
+
+Severity: MEDIUM
 ```
 
-would warrant closer examination.
+A stronger combination could produce:
 
-The tool is intended to assist with **triage and investigation**, not make an automated malware determination.
+```text
+POWERSHELL       +1
+TEMP_PATH        +5
+ENCODED_COMMAND  +5
+HIDDEN_WINDOW    +4
+SCRIPT           +1
+UNSIGNED         +1
+--------------------
+Risk Score       17
+
+Severity: HIGH
+```
+
+The purpose of the scoring system is to prioritize investigation—not make an automatic malware determination.
+
+---
+
+## Improved Command Parsing
+
+Windows persistence commands are not always simple executable paths.
+
+For example:
+
+```text
+"C:\Program Files\Example\Application.exe" --startup
+```
+
+or:
+
+```text
+C:\Windows\System32\rundll32.exe C:\Windows\System32\example.dll,EntryPoint
+```
+
+The scanner uses conservative command parsing to distinguish between:
+
+- Launcher
+- Arguments
+- Explicit payload/target
+
+It avoids assuming that every secondary argument is another executable.
+
+This reduces false `MISSING_FILE` findings from commands such as:
+
+```text
+Update.exe --processStart "Application.exe"
+```
+
+---
+
+## Payload Detection
+
+The scanner attempts to identify explicit payload files for supported launchers.
+
+Examples include:
+
+### PowerShell
+
+```text
+powershell.exe -File C:\Scripts\startup.ps1
+```
+
+Launcher:
+
+```text
+powershell.exe
+```
+
+Target:
+
+```text
+C:\Scripts\startup.ps1
+```
+
+### Rundll32
+
+```text
+rundll32.exe C:\Windows\System32\example.dll,EntryPoint
+```
+
+Launcher:
+
+```text
+rundll32.exe
+```
+
+Target:
+
+```text
+C:\Windows\System32\example.dll
+```
+
+### Windows Script Host
+
+```text
+wscript.exe C:\Scripts\startup.vbs
+```
+
+Launcher:
+
+```text
+wscript.exe
+```
+
+Target:
+
+```text
+C:\Scripts\startup.vbs
+```
+
+Target extraction is intentionally conservative to reduce false positives.
+
+---
+
+## SHA-256 Hashing
+
+When a referenced file exists, the scanner calculates its SHA-256 hash.
+
+Example:
+
+```text
+Launcher SHA-256:
+076592ca1957f8f357cc201f0015072c612f5770ad7de85f87f254253c754dd7
+```
+
+When an explicit payload can be identified, the scanner can hash both the launcher and target.
+
+For example:
+
+```text
+Launcher:
+C:\Windows\System32\rundll32.exe
+
+Launcher SHA-256:
+<hash>
+
+Target:
+C:\Windows\System32\example.dll
+
+Target SHA-256:
+<hash>
+```
+
+Hash results are cached during the scan so identical files do not need to be repeatedly hashed.
+
+---
+
+## Authenticode Analysis
+
+The scanner uses Windows PowerShell to retrieve Authenticode information for files.
+
+Information can include:
+
+```text
+Publisher:
+CN=Microsoft Windows, O=Microsoft Corporation...
+
+Signature:
+Valid
+```
+
+Unsigned files may appear as:
+
+```text
+Publisher:
+Unsigned
+
+Signature:
+NotSigned
+```
+
+An unsigned file is **not automatically malicious**.
+
+Unsigned status contributes only a small amount to the risk score.
+
+---
+
+## Scheduled Tasks
+
+The scanner enumerates Windows Scheduled Tasks and examines tasks containing executable actions.
+
+For each applicable task, it can analyze:
+
+- Task name
+- Task path
+- User/system scope
+- Executable
+- Arguments
+- Launcher
+- Explicit target
+- Publisher
+- Signature
+- SHA-256
+- Risk indicators
+
+Tasks without executable actions are not converted into fake executable paths.
+
+This prevents task metadata from being incorrectly classified as a missing launcher.
+
+---
+
+## Windows Services
+
+The scanner examines **automatic Windows Services**.
+
+Manual-start services are intentionally excluded from the primary persistence scan to reduce noise.
+
+For applicable services, the scanner analyzes the configured executable path and applies the same hashing, publisher, signature, and heuristic analysis used elsewhere.
+
+---
+
+## Example Scan Summary
+
+```text
+SCAN SUMMARY
+============================================================
+
+Total entries      : 204
+High priority      : 0
+Medium priority    : 1
+Low priority       : 7
+No heuristic flags : 196
+```
+
+This does **not** mean that 204 threats were discovered.
+
+It means that 204 persistence/autostart entries were enumerated.
+
+In this example:
+
+```text
+196 -> No configured heuristic flags
+7   -> Minor indicators
+1   -> Recommended for additional review
+0   -> Reached the HIGH threshold
+```
+
+The scanner therefore reduces a large collection of Windows autostart activity into a smaller group of entries for manual investigation.
+
+---
+
+## Example Detailed Finding
+
+```text
+[1] MEDIUM (Score 4) - ExampleTask
+----------------------------------------------------------------------------------------------------
+
+Scope              : Current User
+Startup Type       : Scheduled Task
+Command            : powershell.exe -File C:\Users\User\AppData\Roaming\startup.ps1
+
+Launcher           : C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+Launcher Exists    : YES
+Launcher Publisher : Microsoft Corporation
+Launcher Signature : Valid
+Launcher SHA-256   : <SHA-256>
+
+Target             : C:\Users\User\AppData\Roaming\startup.ps1
+Target Exists      : YES
+Target Publisher   : Unsigned
+Target Signature   : NotSigned
+Target SHA-256     : <SHA-256>
+
+Risk Score         : 4
+Flags              : POWERSHELL, SCRIPT, APPDATA, UNSIGNED
+```
+
+This is a review candidate, not an automatic malware verdict.
 
 ---
 
 ## Requirements
 
 - Windows 10 or Windows 11
-- Python 3
+- Python 3.x
 - Windows PowerShell
 - Administrator privileges recommended
 
-No third-party Python packages are currently required.
-
-The scanner relies primarily on Python's standard library and built-in Windows functionality.
-
----
-
-## Installation
-
-Clone the repository:
-
-```powershell
-git clone <your-repository-url>
-```
-
-Enter the project directory:
-
-```powershell
-cd windows-persistence-scanner
-```
-
-No additional Python dependencies are required.
+The scanner uses Python's standard library and does not require third-party Python packages.
 
 ---
 
 ## Usage
 
-Open **PowerShell** or **Command Prompt**.
+Clone the repository:
 
-For the most complete results, run the terminal as **Administrator**.
+```bash
+git clone https://github.com/YOUR-USERNAME/windows-persistence-scanner.git
+```
 
-Run:
+Enter the project directory:
 
-```powershell
+```bash
+cd windows-persistence-scanner
+```
+
+Run the scanner:
+
+```bash
 python windows_persistence_scanner.py
 ```
 
-If your system uses the Python launcher:
+On systems where Python is accessed through the Python launcher:
 
-```powershell
+```bash
 py windows_persistence_scanner.py
 ```
 
-The scanner will begin enumerating persistence and autostart locations.
-
-Example:
-
-```text
-================================================================================
- WINDOWS PERSISTENCE / AUTOSTART SCANNER
-================================================================================
-
-[*] Scanning Current User Startup folder...
-[*] Scanning All Users Startup folder...
-[*] Scanning Registry Run/RunOnce...
-[*] Scanning Scheduled Tasks...
-[*] Scanning Windows Services...
-[*] Analyzing signatures, paths and SHA-256 hashes...
-```
+For the most complete results, run the terminal as **Administrator**.
 
 ---
 
-## Example Result
-
-```text
-WINDOWS PERSISTENCE / AUTOSTART ANALYSIS
-====================================================================================================
-
-Name             Scope               Startup Type       Exists   Flags
-----------------------------------------------------------------------------------------------------
-SecurityHealth   All Users           Registry Run       YES      None
-ExampleUpdater   Current User        Scheduled Task     YES      LOCAL_APPDATA
-UpdateCheck      Current User        Scheduled Task     YES      ENCODED_COMMAND, HIDDEN_WINDOW
-OldApplication   All Users           Registry Run       NO       MISSING_FILE
-```
-
-The actual console output contains additional columns and color-coded highlighting.
-
----
-
-## SHA-256 Hashing
-
-When a referenced executable exists, the scanner calculates its SHA-256 hash.
-
-Example:
-
-```text
-SHA-256:
-7a9c9e4b67f0d9c8c3e7a12f...
-```
-
-Hashes can assist security analysts with:
-
-- File identification
-- Incident response
-- Threat hunting
-- Malware investigation
-- Comparing binaries between systems
-- Searching threat-intelligence platforms
-
-A hash alone does not determine whether a file is malicious.
-
----
-
-## Publisher Verification
-
-The scanner uses Windows Authenticode information to attempt to determine the publisher of discovered executables.
-
-Possible results include:
-
-```text
-CN=Microsoft Windows, O=Microsoft Corporation...
-```
-
-```text
-Unsigned
-```
-
-```text
-Unknown
-```
-
-```text
-N/A
-```
-
-An unsigned executable is **not automatically malicious**. Publisher information should be considered alongside the file location, startup mechanism, command line, hash, and other evidence.
-
----
-
-## Current User vs. All Users
-
-Where Windows exposes this distinction directly, the scanner identifies whether persistence applies to the current user or system-wide.
-
-Examples:
-
-```text
-HKCU
-→ Current User
-```
-
-```text
-HKLM
-→ All Users
-```
-
-```text
-Current User Startup Folder
-→ Current User
-```
-
-```text
-Common Startup Folder
-→ All Users
-```
-
-Scheduled tasks and Windows services do not always map cleanly to this distinction. System-level entries are therefore generally displayed as:
-
-```text
-System / All Users
-```
-
----
-
-## Read-Only Design
-
-Windows Persistence Scanner is designed as an enumeration and analysis utility.
-
-It does **not**:
-
-- Delete Registry entries
-- Delete scheduled tasks
-- Disable services
-- Terminate processes
-- Remove files
-- Quarantine files
-- Modify startup configuration
-
-Potentially suspicious entries should be investigated before making system changes.
-
----
-
-## Limitations
-
-Windows provides many mechanisms that can be used for legitimate autostart functionality or persistence.
-
-The current version focuses on:
-
-```text
-Startup Folders
-Registry Run / RunOnce
-Scheduled Tasks
-Windows Services
-```
-
-It does not currently provide comprehensive coverage of every possible Windows persistence mechanism.
-
-Potential future areas include:
-
-- Winlogon
-- AppInit DLLs
-- Image File Execution Options
-- WMI event subscriptions
-- Registry policy startup locations
-- Explorer/Shell extensions
-- Additional service persistence analysis
-- Additional scheduled-task analysis
-- Startup Approved Registry locations
-
----
-
-## Future Improvements
-
-Potential improvements include:
-
-- Combination-based risk scoring
-- Detection of suspicious service paths
-- Scheduled-task trigger analysis
-- Parent directory reputation checks
-- Additional Windows persistence locations
-- File creation/modification timestamps
-- PE metadata analysis
-- Microsoft signature validation
-- Duplicate hash detection
-- Interactive filtering
-- Optional JSON/CSV reporting
-- VirusTotal hash lookup integration
-- MITRE ATT&CK technique mapping
-
----
-
-## Example Investigation Workflow
-
-When an unusual entry is discovered:
-
-1. Review the persistence mechanism.
-2. Examine the complete command line.
-3. Verify the executable path.
-4. Check whether the file exists.
-5. Review its digital signature and publisher.
-6. Record the SHA-256 hash.
-7. Examine the file's location.
-8. Research the executable and publisher.
-9. Correlate the entry with other system activity.
-10. Determine whether remediation is appropriate.
-
-Avoid deleting an entry solely because the scanner highlighted it.
-
----
-
-## Security Use
-
-This project is intended for:
-
-- Cybersecurity education
-- Defensive security
-- Blue-team exercises
-- Threat hunting
-- Incident-response training
-- Windows security auditing
-- Digital-forensics practice
-- Authorized system administration
-
-Only analyze systems you own or have authorization to examine.
-
----
-
-## Project Structure
+## Repository Structure
 
 ```text
 windows-persistence-scanner/
@@ -491,16 +494,159 @@ windows-persistence-scanner/
 
 ---
 
-## Disclaimer
+## Screenshot
 
-Windows Persistence Scanner is provided for educational, administrative, and defensive security purposes.
-
-Security flags generated by the tool are heuristic indicators and should not be interpreted as definitive evidence that software is malicious.
-
-Always validate findings before modifying or removing system components.
+![Windows Persistence Scanner Results](screenshots/windows-persistence-scanner-results.png)
 
 ---
 
-## Author
+## Current User vs All Users
 
-Developed as a Python cybersecurity project focused on Windows persistence enumeration, security auditing, and defensive analysis.
+The scanner distinguishes persistence scope.
+
+### Current User
+
+Examples include:
+
+```text
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+```
+
+and:
+
+```text
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+```
+
+These normally apply to the currently logged-in user.
+
+### All Users / System
+
+Examples include:
+
+```text
+HKLM\Software\Microsoft\Windows\CurrentVersion\Run
+```
+
+automatic Windows Services, system Scheduled Tasks, and:
+
+```text
+%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs\StartUp
+```
+
+These can affect the entire system or multiple users.
+
+---
+
+## Read-Only Design
+
+Windows Persistence Scanner is designed as an **auditing and analysis tool**.
+
+It does not:
+
+- Delete Registry entries
+- Delete Scheduled Tasks
+- Stop Services
+- Remove Startup applications
+- Quarantine files
+- Modify executable files
+- Automatically classify a program as malware
+
+Remediation decisions remain with the analyst.
+
+---
+
+## Limitations
+
+This project is not a replacement for an EDR, antivirus platform, SIEM, or professional incident-response toolkit.
+
+The scanner currently focuses on selected common persistence mechanisms.
+
+Not every Windows persistence technique is covered.
+
+Potential limitations include:
+
+- Some executable paths may not resolve correctly
+- Some Scheduled Task action types may not contain executable paths
+- Some services use `svchost.exe`, where the actual service implementation resides in a separate DLL
+- Publisher information depends on Windows Authenticode
+- Legitimate applications may be unsigned
+- Signed files can still potentially be abused
+- Heuristic scoring cannot determine intent
+- File hashes do not independently determine whether a file is malicious
+- `CLEAN` means no configured heuristic matched, not guaranteed safe
+
+---
+
+## Future Improvements
+
+Potential future additions include:
+
+- Service DLL resolution for `svchost.exe`
+- Scheduled Task trigger analysis
+- Boot-trigger and logon-trigger identification
+- Winlogon persistence
+- Shell persistence
+- AppInit DLL analysis
+- Image File Execution Options
+- WMI permanent event subscriptions
+- Startup Approved Registry analysis
+- Registry policy startup mechanisms
+- Explorer/Shell extension analysis
+- File creation/modification timestamps
+- PE metadata analysis
+- Parent directory permission analysis
+- Improved Microsoft signature validation
+- Duplicate hash identification
+- JSON export
+- CSV export
+- VirusTotal hash lookup
+- MITRE ATT&CK technique mapping
+- Configurable risk thresholds
+- Allowlist support
+
+---
+
+## MITRE ATT&CK Relevance
+
+Several persistence mechanisms examined by this project relate to Windows techniques documented by the MITRE ATT&CK framework, including areas such as:
+
+- Boot or Logon Autostart Execution
+- Registry Run Keys / Startup Folder
+- Scheduled Task/Job
+- Windows Service
+
+Future versions may map individual findings directly to applicable ATT&CK technique identifiers.
+
+---
+
+## Intended Use
+
+This project was created for:
+
+- Cybersecurity education
+- Defensive security
+- Threat hunting
+- Windows security auditing
+- Incident-response training
+- Digital-forensics practice
+- Blue-team labs
+- Portfolio development
+
+Use the scanner only on systems you own or are authorized to analyze.
+
+---
+
+## Disclaimer
+
+Windows Persistence Scanner is provided for educational and defensive security purposes.
+
+The heuristic scoring system is intended to assist analysts with prioritization. A HIGH, MEDIUM, or LOW result is **not proof that a file or persistence mechanism is malicious**, and a CLEAN result is **not proof that an entry is safe**.
+
+Always validate findings using additional evidence before taking remediation action.
+
+---
+
+## License
+
+This project is intended to be distributed under the MIT License. See `LICENSE` for details.
