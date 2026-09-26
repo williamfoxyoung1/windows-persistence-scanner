@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import shutil
 import hashlib
 import subprocess
 import winreg
@@ -8,36 +9,49 @@ from pathlib import Path
 
 
 # ============================================================
-# Windows Persistence / Autostart Scanner
+# WINDOWS PERSISTENCE SCANNER
+# Conservative Risk-Scoring Edition
+# ============================================================
 #
-# Enumerates:
+# Scans:
 #   - Current User Startup Folder
 #   - All Users Startup Folder
 #   - HKCU Run / RunOnce
 #   - HKLM Run / RunOnce (32-bit + 64-bit)
-#   - Windows Scheduled Tasks
-#   - Windows Services
+#   - Scheduled Tasks
+#   - Automatic Windows Services
 #
-# Displays:
-#   Name
-#   Scope
-#   Startup Type
-#   Command
-#   Executable Path
-#   Exists
-#   Publisher
-#   SHA-256
-#   Flags
+# Collects:
+#   - Name
+#   - Scope
+#   - Startup Type
+#   - Command
+#   - Launcher
+#   - Target / payload when confidently identifiable
+#   - File existence
+#   - Publisher
+#   - Authenticode status
+#   - SHA-256
+#   - Flags
+#   - Risk score
+#   - Severity
 #
-# READ-ONLY: This script does not disable/delete/modify entries.
+# IMPORTANT:
+# This is a triage tool.
+# A flag does NOT mean malware.
+#
+# No persistence entries are modified or deleted.
 # ============================================================
 
 
 results = []
 
+HASH_CACHE = {}
+SIGNATURE_CACHE = {}
+
 
 # ============================================================
-# CONSOLE COLORS
+# COLORS
 # ============================================================
 
 RESET = "\033[0m"
@@ -46,15 +60,12 @@ YELLOW = "\033[93m"
 GREEN = "\033[92m"
 CYAN = "\033[96m"
 MAGENTA = "\033[95m"
+WHITE = "\033[97m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 
 
 def enable_windows_ansi():
-    """
-    Enable ANSI escape processing on supported Windows consoles.
-    Modern Windows Terminal / PowerShell generally supports this.
-    """
 
     if os.name != "nt":
         return
@@ -63,12 +74,14 @@ def enable_windows_ansi():
         import ctypes
 
         kernel32 = ctypes.windll.kernel32
-
         handle = kernel32.GetStdHandle(-11)
 
         mode = ctypes.c_uint32()
 
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        if kernel32.GetConsoleMode(
+            handle,
+            ctypes.byref(mode)
+        ):
             kernel32.SetConsoleMode(
                 handle,
                 mode.value | 0x0004
@@ -79,37 +92,19 @@ def enable_windows_ansi():
 
 
 # ============================================================
-# GENERAL HELPERS
+# POWERSHELL
 # ============================================================
 
-def expand_path(value):
-
-    if not value:
-        return ""
-
-    return os.path.expandvars(
-        str(value).strip()
-    )
-
-
-def shorten(value, length):
-
-    value = str(value)
-
-    if len(value) <= length:
-        return value
-
-    return value[:length - 3] + "..."
-
-
 def powershell(command, timeout=30):
-    """
-    Execute a PowerShell command and return stdout.
-    """
 
     try:
 
-        result = subprocess.run(
+        creation_flags = 0
+
+        if os.name == "nt":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
+        process = subprocess.run(
             [
                 "powershell.exe",
                 "-NoProfile",
@@ -122,81 +117,532 @@ def powershell(command, timeout=30):
             capture_output=True,
             text=True,
             timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=creation_flags
         )
 
-        return result.stdout.strip()
+        return process.stdout.strip()
 
     except Exception:
         return ""
 
 
 # ============================================================
-# EXECUTABLE PATH EXTRACTION
+# ENVIRONMENT / PATH HELPERS
 # ============================================================
 
-def extract_executable(command):
+def expand_environment_variables(value):
+
+    if not value:
+        return ""
+
+    value = str(value)
+
+    value = os.path.expandvars(value)
+
+    system_root = os.environ.get(
+        "SystemRoot",
+        r"C:\Windows"
+    )
+
+    replacements = {
+        "%windir%": system_root,
+        "%systemroot%": system_root
+    }
+
+    for variable, replacement in replacements.items():
+
+        value = re.sub(
+            re.escape(variable),
+            lambda _: replacement,
+            value,
+            flags=re.IGNORECASE
+        )
+
+    return value
+
+
+def normalize_path(path):
+
+    if not path:
+        return ""
+
+    path = str(path).strip()
+
+    path = path.strip('"').strip("'")
+
+    path = expand_environment_variables(path)
+
+    system_root = os.environ.get(
+        "SystemRoot",
+        r"C:\Windows"
+    )
+
+    # Handle:
+    # \SystemRoot\System32\something.exe
+
+    if path.lower().startswith(
+        "\\systemroot\\"
+    ):
+
+        remainder = path[
+            len("\\SystemRoot\\"):
+        ]
+
+        path = os.path.join(
+            system_root,
+            remainder
+        )
+
+    return os.path.normpath(path)
+
+
+def file_exists(path):
+
+    if not path:
+        return False
+
+    try:
+        return os.path.isfile(path)
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# PROGRAM RESOLUTION
+# ============================================================
+
+def resolve_program(program):
+
+    if not program:
+        return ""
+
+    program = normalize_path(program)
+
+    if file_exists(program):
+        return os.path.abspath(program)
+
+    # Bare executable name.
+    # Example:
+    # powershell.exe
+
+    if (
+        "\\" not in program
+        and "/" not in program
+    ):
+
+        found = shutil.which(program)
+
+        if found and file_exists(found):
+
+            return os.path.abspath(
+                found
+            )
+
+    system_root = os.environ.get(
+        "SystemRoot",
+        r"C:\Windows"
+    )
+
+    if (
+        "\\" not in program
+        and "/" not in program
+    ):
+
+        candidates = [
+            os.path.join(
+                system_root,
+                "System32",
+                program
+            ),
+
+            os.path.join(
+                system_root,
+                "SysWOW64",
+                program
+            ),
+
+            os.path.join(
+                system_root,
+                program
+            )
+        ]
+
+        for candidate in candidates:
+
+            if file_exists(candidate):
+
+                return os.path.abspath(
+                    candidate
+                )
+
+    return program
+
+
+# ============================================================
+# COMMAND PARSING
+# ============================================================
+
+EXECUTABLE_EXTENSIONS = (
+    ".exe",
+    ".com",
+    ".scr",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".vbs",
+    ".js",
+    ".jse",
+    ".wsf"
+)
+
+
+def extract_launcher(command):
     """
-    Best-effort extraction of an executable/script path from a
-    Windows command line.
+    Conservatively extract the primary executable.
+
+    Handles:
+
+        "C:\\Program Files\\Example\\app.exe" --start
+
+        C:\\Program Files\\Example\\app.exe --start
+
+        powershell.exe -File script.ps1
+
+    Does NOT split an unquoted Program Files path at the first
+    space.
     """
 
     if not command:
         return ""
 
-    command = expand_path(command.strip())
-
-    # Remove leading whitespace
-    command = command.lstrip()
-
-    # Quoted executable
-    match = re.match(
-        r'^"([^"]+\.(?:exe|com|bat|cmd|ps1|vbs|js|jse|wsf|scr|dll))"',
-        command,
-        re.I
+    command = expand_environment_variables(
+        str(command).strip()
     )
 
-    if match:
-        return match.group(1)
-
-    # Unquoted executable
-    match = re.match(
-        r'^(.+?\.(?:exe|com|bat|cmd|ps1|vbs|js|jse|wsf|scr|dll))(?=\s|$)',
-        command,
-        re.I
-    )
-
-    if match:
-        return match.group(1).strip()
-
-    return command
-
-
-# ============================================================
-# SHORTCUT RESOLUTION
-# ============================================================
-
-def resolve_shortcut(shortcut):
-
-    try:
-
-        escaped = str(shortcut).replace(
-            "'",
-            "''"
-        )
-
-        command = (
-            "$ws = New-Object -ComObject WScript.Shell;"
-            f"$s = $ws.CreateShortcut('{escaped}');"
-            "$s.TargetPath"
-        )
-
-        return expand_path(
-            powershell(command, 10)
-        )
-
-    except Exception:
+    if not command:
         return ""
+
+    # --------------------------------------------------------
+    # Quoted launcher
+    # --------------------------------------------------------
+
+    if command.startswith('"'):
+
+        end_quote = command.find(
+            '"',
+            1
+        )
+
+        if end_quote != -1:
+
+            candidate = command[
+                1:end_quote
+            ].strip()
+
+            if candidate:
+
+                return resolve_program(
+                    candidate
+                )
+
+    # --------------------------------------------------------
+    # Unquoted launcher
+    #
+    # Stop at executable extension, not whitespace.
+    # --------------------------------------------------------
+
+    match = re.match(
+        r"^(.+?\.(?:exe|com|scr|bat|cmd|ps1|vbs|js|jse|wsf))"
+        r"(?=\s|$)",
+        command,
+        flags=re.IGNORECASE
+    )
+
+    if match:
+
+        return resolve_program(
+            match.group(1).strip()
+        )
+
+    # --------------------------------------------------------
+    # Bare executable fallback
+    # --------------------------------------------------------
+
+    first = command.split()[0]
+
+    if first.lower().endswith(
+        EXECUTABLE_EXTENSIONS
+    ):
+
+        return resolve_program(
+            first
+        )
+
+    return ""
+
+
+def extract_arguments(
+    command,
+    launcher
+):
+
+    if not command or not launcher:
+        return ""
+
+    command = expand_environment_variables(
+        str(command).strip()
+    )
+
+    # Quoted launcher
+
+    if command.startswith('"'):
+
+        end_quote = command.find(
+            '"',
+            1
+        )
+
+        if end_quote != -1:
+
+            return command[
+                end_quote + 1:
+            ].strip()
+
+    # Unquoted launcher
+
+    match = re.match(
+        r"^(.+?\.(?:exe|com|scr|bat|cmd|ps1|vbs|js|jse|wsf))"
+        r"(?:\s+(.*))?$",
+        command,
+        flags=re.IGNORECASE
+    )
+
+    if match:
+
+        return (
+            match.group(2)
+            or ""
+        ).strip()
+
+    return ""
+
+
+# ============================================================
+# EXPLICIT TARGET DETECTION
+# ============================================================
+
+def resolve_bare_system_dll(target):
+
+    if not target:
+        return ""
+
+    target = normalize_path(target)
+
+    if (
+        "\\" in target
+        or "/" in target
+    ):
+        return target
+
+    system_root = os.environ.get(
+        "SystemRoot",
+        r"C:\Windows"
+    )
+
+    candidates = [
+        os.path.join(
+            system_root,
+            "System32",
+            target
+        ),
+        os.path.join(
+            system_root,
+            "SysWOW64",
+            target
+        )
+    ]
+
+    for candidate in candidates:
+
+        if file_exists(candidate):
+            return candidate
+
+    return target
+
+
+def find_explicit_target(
+    launcher,
+    arguments
+):
+    """
+    Only identify a target when the launcher syntax strongly
+    indicates that a particular file is the payload.
+
+    We intentionally DO NOT treat arbitrary command arguments
+    as target files.
+
+    This prevents false positives such as:
+
+        Update.exe --processStart "Teams.exe"
+
+    being interpreted as a missing persistence payload.
+    """
+
+    if not launcher or not arguments:
+        return ""
+
+    launcher_name = os.path.basename(
+        launcher
+    ).lower()
+
+    arguments = expand_environment_variables(
+        arguments
+    ).strip()
+
+    # ========================================================
+    # PowerShell
+    # ========================================================
+
+    if launcher_name in (
+        "powershell.exe",
+        "pwsh.exe"
+    ):
+
+        match = re.search(
+            r'(?:^|\s)-(?:file|f)\s+'
+            r'(?:"([^"]+)"|([^\s]+))',
+            arguments,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            target = (
+                match.group(1)
+                or match.group(2)
+                or ""
+            )
+
+            return normalize_path(
+                target
+            )
+
+        return ""
+
+    # ========================================================
+    # WScript / CScript
+    # ========================================================
+
+    if launcher_name in (
+        "wscript.exe",
+        "cscript.exe"
+    ):
+
+        match = re.search(
+            r'(?:"([^"]+\.(?:vbs|js|jse|wsf))"'
+            r'|([^\s"]+\.(?:vbs|js|jse|wsf)))',
+            arguments,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            target = (
+                match.group(1)
+                or match.group(2)
+                or ""
+            )
+
+            return normalize_path(
+                target
+            )
+
+        return ""
+
+    # ========================================================
+    # Rundll32
+    # ========================================================
+
+    if launcher_name == "rundll32.exe":
+
+        match = re.search(
+            r'(?:"([^"]+\.dll)(?:,[^"]*)?"'
+            r'|([^\s,]+\.dll)(?:,[^\s]*)?)',
+            arguments,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            target = (
+                match.group(1)
+                or match.group(2)
+                or ""
+            )
+
+            return resolve_bare_system_dll(
+                target
+            )
+
+        return ""
+
+    # ========================================================
+    # Regsvr32
+    # ========================================================
+
+    if launcher_name == "regsvr32.exe":
+
+        match = re.search(
+            r'(?:"([^"]+\.dll)"'
+            r'|([^\s"]+\.dll))',
+            arguments,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            target = (
+                match.group(1)
+                or match.group(2)
+                or ""
+            )
+
+            return normalize_path(
+                target
+            )
+
+        return ""
+
+    # ========================================================
+    # CMD
+    #
+    # Only identify explicit script targets.
+    # ========================================================
+
+    if launcher_name == "cmd.exe":
+
+        match = re.search(
+            r'(?:^|\s)/(?:c|k)\s+'
+            r'(?:"([^"]+\.(?:bat|cmd))"'
+            r'|([^\s"]+\.(?:bat|cmd)))',
+            arguments,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            target = (
+                match.group(1)
+                or match.group(2)
+                or ""
+            )
+
+            return normalize_path(
+                target
+            )
+
+    return ""
 
 
 # ============================================================
@@ -208,14 +654,26 @@ def calculate_sha256(file_path):
     if not file_path:
         return "N/A"
 
-    if not os.path.isfile(file_path):
+    file_path = normalize_path(
+        file_path
+    )
+
+    if not file_exists(file_path):
         return "N/A"
+
+    cache_key = file_path.lower()
+
+    if cache_key in HASH_CACHE:
+        return HASH_CACHE[cache_key]
 
     try:
 
-        sha = hashlib.sha256()
+        sha256 = hashlib.sha256()
 
-        with open(file_path, "rb") as file:
+        with open(
+            file_path,
+            "rb"
+        ) as file:
 
             while True:
 
@@ -226,239 +684,850 @@ def calculate_sha256(file_path):
                 if not chunk:
                     break
 
-                sha.update(chunk)
+                sha256.update(chunk)
 
-        return sha.hexdigest()
+        digest = sha256.hexdigest()
 
-    except (PermissionError, OSError):
+        HASH_CACHE[
+            cache_key
+        ] = digest
+
+        return digest
+
+    except PermissionError:
+
+        HASH_CACHE[
+            cache_key
+        ] = "ACCESS_DENIED"
+
+        return "ACCESS_DENIED"
+
+    except OSError:
+
+        HASH_CACHE[
+            cache_key
+        ] = "ERROR"
+
         return "ERROR"
 
 
 # ============================================================
-# AUTHENTICODE / PUBLISHER
+# AUTHENTICODE
 # ============================================================
 
-def get_publisher(file_path):
+def get_signature_information(
+    file_path
+):
+
+    default = {
+        "Status": "N/A",
+        "Publisher": "N/A"
+    }
 
     if not file_path:
-        return "N/A"
+        return default
 
-    if not os.path.isfile(file_path):
-        return "N/A"
+    file_path = normalize_path(
+        file_path
+    )
+
+    if not file_exists(file_path):
+        return default
+
+    cache_key = file_path.lower()
+
+    if cache_key in SIGNATURE_CACHE:
+
+        return SIGNATURE_CACHE[
+            cache_key
+        ]
+
+    escaped = file_path.replace(
+        "'",
+        "''"
+    )
+
+    command = f"""
+$s = Get-AuthenticodeSignature -LiteralPath '{escaped}'
+
+$publisher = ''
+
+if ($s.SignerCertificate) {{
+    $publisher = [string]$s.SignerCertificate.Subject
+}}
+
+[PSCustomObject]@{{
+    Status = [string]$s.Status
+    Publisher = $publisher
+}} | ConvertTo-Json -Compress
+"""
+
+    output = powershell(
+        command,
+        20
+    )
 
     try:
 
-        escaped = file_path.replace(
-            "'",
-            "''"
+        data = json.loads(
+            output
         )
 
-        command = (
-            f"$sig = Get-AuthenticodeSignature "
-            f"-LiteralPath '{escaped}';"
-            "if ($sig.SignerCertificate) {"
-            "$sig.SignerCertificate.Subject"
-            "} elseif ($sig.Status -eq 'NotSigned') {"
-            "'Unsigned'"
-            "} else {"
-            "'Unknown'"
-            "}"
+        status = (
+            data.get("Status")
+            or "Unknown"
         )
 
-        output = powershell(
-            command,
-            15
+        publisher = (
+            data.get("Publisher")
+            or ""
         )
-
-        if output:
-            return output
-
-    except Exception:
-        pass
-
-    return "Unknown"
-
-
-# ============================================================
-# SECURITY HEURISTICS
-# ============================================================
-
-def suspicious_flags(
-    executable_path,
-    exists,
-    publisher,
-    command="",
-    startup_type=""
-):
-
-    flags = []
-
-    path = (
-        executable_path or ""
-    ).lower()
-
-    command_lower = (
-        command or ""
-    ).lower()
-
-    # --------------------------------------------------------
-    # Missing executable
-    # --------------------------------------------------------
-
-    if executable_path and not exists:
-        flags.append("MISSING_FILE")
-
-    # --------------------------------------------------------
-    # TEMP
-    # --------------------------------------------------------
-
-    temp_paths = [
-        os.environ.get("TEMP", ""),
-        os.environ.get("TMP", "")
-    ]
-
-    for temp in temp_paths:
 
         if (
-            temp
-            and path.startswith(
-                temp.lower()
+            not publisher
+            and status == "NotSigned"
+        ):
+            publisher = "Unsigned"
+
+        elif not publisher:
+            publisher = "Unknown"
+
+        result = {
+            "Status": status,
+            "Publisher": publisher
+        }
+
+    except Exception:
+
+        result = {
+            "Status": "Unknown",
+            "Publisher": "Unknown"
+        }
+
+    SIGNATURE_CACHE[
+        cache_key
+    ] = result
+
+    return result
+
+
+# ============================================================
+# SHORTCUT RESOLUTION
+# ============================================================
+
+def resolve_shortcut(
+    shortcut_path
+):
+
+    escaped = str(
+        shortcut_path
+    ).replace(
+        "'",
+        "''"
+    )
+
+    command = f"""
+$ws = New-Object -ComObject WScript.Shell
+$s = $ws.CreateShortcut('{escaped}')
+
+[PSCustomObject]@{{
+    TargetPath = [string]$s.TargetPath
+    Arguments  = [string]$s.Arguments
+}} | ConvertTo-Json -Compress
+"""
+
+    output = powershell(
+        command,
+        15
+    )
+
+    try:
+
+        data = json.loads(
+            output
+        )
+
+        return (
+            data.get(
+                "TargetPath"
+            )
+            or "",
+            data.get(
+                "Arguments"
+            )
+            or ""
+        )
+
+    except Exception:
+
+        return "", ""
+
+
+# ============================================================
+# PATH CLASSIFICATION
+# ============================================================
+
+def path_inside(
+    path,
+    directory
+):
+
+    if not path or not directory:
+        return False
+
+    try:
+
+        path = os.path.abspath(
+            normalize_path(path)
+        )
+
+        directory = os.path.abspath(
+            normalize_path(directory)
+        )
+
+        return (
+            os.path.commonpath(
+                [path, directory]
+            ).lower()
+            ==
+            directory.lower()
+        )
+
+    except Exception:
+
+        return False
+
+
+def is_temp_path(path):
+
+    if not path:
+        return False
+
+    for variable in (
+        "TEMP",
+        "TMP"
+    ):
+
+        location = os.environ.get(
+            variable,
+            ""
+        )
+
+        if (
+            location
+            and path_inside(
+                path,
+                location
             )
         ):
+            return True
 
-            flags.append("TEMP_PATH")
-            break
+    return False
 
-    # --------------------------------------------------------
-    # Downloads
-    # --------------------------------------------------------
+
+def is_downloads_path(path):
 
     profile = os.environ.get(
         "USERPROFILE",
         ""
     )
 
-    if profile:
+    if not profile:
+        return False
 
-        downloads = os.path.join(
+    return path_inside(
+        path,
+        os.path.join(
             profile,
             "Downloads"
-        ).lower()
-
-        if path.startswith(downloads):
-            flags.append("DOWNLOADS_PATH")
-
-    # --------------------------------------------------------
-    # AppData
-    # --------------------------------------------------------
-
-    roaming = os.environ.get(
-        "APPDATA",
-        ""
-    ).lower()
-
-    local = os.environ.get(
-        "LOCALAPPDATA",
-        ""
-    ).lower()
-
-    if roaming and path.startswith(roaming):
-        flags.append("APPDATA")
-
-    elif local and path.startswith(local):
-        flags.append("LOCAL_APPDATA")
-
-    # --------------------------------------------------------
-    # Script execution
-    # --------------------------------------------------------
-
-    script_extensions = (
-        ".ps1",
-        ".vbs",
-        ".js",
-        ".jse",
-        ".wsf",
-        ".cmd",
-        ".bat"
+        )
     )
 
-    if path.endswith(script_extensions):
-        flags.append("SCRIPT")
 
-    # --------------------------------------------------------
-    # Common script / LOLBin interpreters
-    # --------------------------------------------------------
+def is_roaming_appdata(path):
 
-    interpreters = [
-        "powershell.exe",
-        "pwsh.exe",
-        "wscript.exe",
-        "cscript.exe",
-        "mshta.exe",
-        "rundll32.exe",
-        "regsvr32.exe"
-    ]
+    location = os.environ.get(
+        "APPDATA",
+        ""
+    )
 
-    for interpreter in interpreters:
-
-        if interpreter in command_lower:
-
-            flags.append(
-                "INTERPRETER"
-            )
-
-            break
-
-    # --------------------------------------------------------
-    # Encoded PowerShell
-    # --------------------------------------------------------
-
-    encoded_patterns = [
-        "-enc ",
-        "-encodedcommand",
-        "/encodedcommand"
-    ]
-
-    if any(
-        pattern in command_lower
-        for pattern in encoded_patterns
-    ):
-        flags.append("ENCODED_COMMAND")
-
-    # --------------------------------------------------------
-    # Hidden PowerShell
-    # --------------------------------------------------------
-
-    if (
-        "powershell" in command_lower
-        and (
-            "-windowstyle hidden" in command_lower
-            or "-w hidden" in command_lower
+    return (
+        bool(location)
+        and path_inside(
+            path,
+            location
         )
-    ):
+    )
 
-        flags.append("HIDDEN_WINDOW")
 
-    # --------------------------------------------------------
-    # Network paths
-    # --------------------------------------------------------
+def is_local_appdata(path):
 
-    if path.startswith("\\\\"):
-        flags.append("NETWORK_PATH")
+    location = os.environ.get(
+        "LOCALAPPDATA",
+        ""
+    )
 
-    # --------------------------------------------------------
-    # Unsigned
-    # --------------------------------------------------------
+    return (
+        bool(location)
+        and path_inside(
+            path,
+            location
+        )
+    )
 
-    if publisher == "Unsigned":
-        flags.append("UNSIGNED")
 
-    # Remove duplicates
-    return list(dict.fromkeys(flags))
+def is_network_path(path):
+
+    if not path:
+        return False
+
+    return str(path).startswith(
+        "\\\\"
+    )
+
+
+def is_user_writable_location(
+    path
+):
+
+    if not path:
+        return False
+
+    locations = [
+        os.environ.get(
+            "USERPROFILE",
+            ""
+        ),
+        os.environ.get(
+            "TEMP",
+            ""
+        ),
+        os.environ.get(
+            "TMP",
+            ""
+        )
+    ]
+
+    for location in locations:
+
+        if (
+            location
+            and path_inside(
+                path,
+                location
+            )
+        ):
+            return True
+
+    return False
 
 
 # ============================================================
-# RESULT PROCESSING
+# MICROSOFT SIGNATURE CHECK
+# ============================================================
+
+def is_microsoft_publisher(
+    publisher
+):
+
+    if not publisher:
+        return False
+
+    publisher = publisher.lower()
+
+    return (
+        "microsoft corporation"
+        in publisher
+        or
+        "microsoft windows"
+        in publisher
+    )
+
+
+# ============================================================
+# FLAGS + WEIGHTS
+# ============================================================
+
+# Conservative scoring:
+#
+# 0        CLEAN
+# 1-2      LOW
+# 3-5      MEDIUM
+# 6+       HIGH
+#
+# Strong behaviors carry most of the score.
+# Common characteristics carry very little.
+
+
+FLAG_SCORES = {
+
+    # --------------------------------------------------------
+    # Strong indicators
+    # --------------------------------------------------------
+
+    "TEMP_PATH": 5,
+
+    "DOWNLOADS_PATH": 5,
+
+    "ENCODED_COMMAND": 5,
+
+    "HIDDEN_WINDOW": 4,
+
+    # --------------------------------------------------------
+    # Moderate indicators
+    # --------------------------------------------------------
+
+    "NETWORK_PATH": 3,
+
+    "SYSTEM_USER_WRITABLE": 3,
+
+    "MISSING_FILE": 2,
+
+    "MSHTA": 2,
+
+    # --------------------------------------------------------
+    # Weak indicators
+    # --------------------------------------------------------
+
+    "POWERSHELL": 1,
+
+    "CMD": 1,
+
+    "RUNDLL32": 1,
+
+    "REGSVR32": 1,
+
+    "WSCRIPT": 1,
+
+    "CSCRIPT": 1,
+
+    "SCRIPT": 1,
+
+    "APPDATA": 1,
+
+    "LOCAL_APPDATA": 1,
+
+    "UNSIGNED": 1
+}
+
+
+# ============================================================
+# FLAG DETECTION
+# ============================================================
+
+def detect_flags(
+    scope,
+    startup_type,
+    launcher,
+    target,
+    command,
+    launcher_signature,
+    target_signature
+):
+
+    flags = []
+
+    launcher_name = (
+        os.path.basename(
+            launcher
+        ).lower()
+        if launcher
+        else ""
+    )
+
+    analysis_path = (
+        target
+        if target
+        else launcher
+    )
+
+    command_lower = (
+        command or ""
+    ).lower()
+
+    # ========================================================
+    # LOCATION FLAGS
+    # ========================================================
+
+    if (
+        analysis_path
+        and is_temp_path(
+            analysis_path
+        )
+    ):
+
+        flags.append(
+            "TEMP_PATH"
+        )
+
+    if (
+        analysis_path
+        and is_downloads_path(
+            analysis_path
+        )
+    ):
+
+        flags.append(
+            "DOWNLOADS_PATH"
+        )
+
+    if (
+        analysis_path
+        and is_roaming_appdata(
+            analysis_path
+        )
+    ):
+
+        flags.append(
+            "APPDATA"
+        )
+
+    elif (
+        analysis_path
+        and is_local_appdata(
+            analysis_path
+        )
+    ):
+
+        flags.append(
+            "LOCAL_APPDATA"
+        )
+
+    if (
+        analysis_path
+        and is_network_path(
+            analysis_path
+        )
+    ):
+
+        flags.append(
+            "NETWORK_PATH"
+        )
+
+    # ========================================================
+    # INTERPRETERS / LOLBINS
+    # ========================================================
+
+    if launcher_name in (
+        "powershell.exe",
+        "pwsh.exe"
+    ):
+
+        flags.append(
+            "POWERSHELL"
+        )
+
+    elif launcher_name == "cmd.exe":
+
+        flags.append(
+            "CMD"
+        )
+
+    elif launcher_name == "rundll32.exe":
+
+        flags.append(
+            "RUNDLL32"
+        )
+
+    elif launcher_name == "regsvr32.exe":
+
+        flags.append(
+            "REGSVR32"
+        )
+
+    elif launcher_name == "mshta.exe":
+
+        flags.append(
+            "MSHTA"
+        )
+
+    elif launcher_name == "wscript.exe":
+
+        flags.append(
+            "WSCRIPT"
+        )
+
+    elif launcher_name == "cscript.exe":
+
+        flags.append(
+            "CSCRIPT"
+        )
+
+    # ========================================================
+    # SCRIPT
+    # ========================================================
+
+    if (
+        analysis_path
+        and analysis_path.lower().endswith(
+            (
+                ".ps1",
+                ".bat",
+                ".cmd",
+                ".vbs",
+                ".js",
+                ".jse",
+                ".wsf"
+            )
+        )
+    ):
+
+        flags.append(
+            "SCRIPT"
+        )
+
+    # ========================================================
+    # POWERSHELL BEHAVIOR
+    # ========================================================
+
+    if launcher_name in (
+        "powershell.exe",
+        "pwsh.exe"
+    ):
+
+        encoded_patterns = [
+            r"(?:^|\s)-encodedcommand(?:\s|$)",
+            r"(?:^|\s)-enc(?:\s|$)"
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                command_lower,
+                re.IGNORECASE
+            )
+            for pattern in encoded_patterns
+        ):
+
+            flags.append(
+                "ENCODED_COMMAND"
+            )
+
+        hidden_patterns = (
+            "-windowstyle hidden",
+            "-windowstyle:hidden",
+            "-w hidden"
+        )
+
+        if any(
+            pattern in command_lower
+            for pattern in hidden_patterns
+        ):
+
+            flags.append(
+                "HIDDEN_WINDOW"
+            )
+
+    # ========================================================
+    # SYSTEM PERSISTENCE -> USER-WRITABLE LOCATION
+    # ========================================================
+
+    if (
+        scope
+        in (
+            "All Users",
+            "System / All Users"
+        )
+        and analysis_path
+        and is_user_writable_location(
+            analysis_path
+        )
+    ):
+
+        flags.append(
+            "SYSTEM_USER_WRITABLE"
+        )
+
+    # ========================================================
+    # MISSING FILE
+    #
+    # Only use actual resolved path-like references.
+    # Bare optional names are not flagged.
+    # ========================================================
+
+    if launcher:
+
+        path_like = (
+            "\\" in launcher
+            or "/" in launcher
+        )
+
+        if (
+            path_like
+            and not file_exists(
+                launcher
+            )
+        ):
+
+            flags.append(
+                "MISSING_FILE"
+            )
+
+    if target:
+
+        target_path_like = (
+            "\\" in target
+            or "/" in target
+        )
+
+        if (
+            target_path_like
+            and not file_exists(
+                target
+            )
+        ):
+
+            flags.append(
+                "MISSING_FILE"
+            )
+
+    # ========================================================
+    # UNSIGNED
+    #
+    # Weak indicator only.
+    #
+    # Prefer target signature when a target exists.
+    # ========================================================
+
+    if target:
+
+        signature = (
+            target_signature
+        )
+
+    else:
+
+        signature = (
+            launcher_signature
+        )
+
+    if (
+        signature.get("Status")
+        == "NotSigned"
+    ):
+
+        flags.append(
+            "UNSIGNED"
+        )
+
+    # Remove duplicates while preserving order.
+
+    return list(
+        dict.fromkeys(
+            flags
+        )
+    )
+
+
+# ============================================================
+# CONSERVATIVE SCORE CALCULATION
+# ============================================================
+
+def calculate_risk_score(
+    flags,
+    launcher_publisher,
+    target_publisher
+):
+
+    score = sum(
+        FLAG_SCORES.get(
+            flag,
+            0
+        )
+        for flag in flags
+    )
+
+    # ========================================================
+    # FALSE-POSITIVE REDUCTION
+    #
+    # Microsoft-signed Windows components commonly use
+    # rundll32, PowerShell, cmd, etc.
+    #
+    # Do not completely remove the flag.
+    # Instead reduce weak interpreter-only scoring.
+    # ========================================================
+
+    publisher = (
+        target_publisher
+        if (
+            target_publisher
+            and target_publisher
+            not in (
+                "N/A",
+                "Unknown",
+                "Unsigned"
+            )
+        )
+        else launcher_publisher
+    )
+
+    microsoft_signed = (
+        is_microsoft_publisher(
+            publisher
+        )
+    )
+
+    strong_flags = {
+        "TEMP_PATH",
+        "DOWNLOADS_PATH",
+        "ENCODED_COMMAND",
+        "HIDDEN_WINDOW",
+        "NETWORK_PATH",
+        "SYSTEM_USER_WRITABLE"
+    }
+
+    has_strong_flag = bool(
+        set(flags)
+        & strong_flags
+    )
+
+    weak_interpreter_flags = {
+        "POWERSHELL",
+        "CMD",
+        "RUNDLL32",
+        "REGSVR32",
+        "WSCRIPT",
+        "CSCRIPT"
+    }
+
+    if (
+        microsoft_signed
+        and not has_strong_flag
+    ):
+
+        weak_count = len(
+            set(flags)
+            & weak_interpreter_flags
+        )
+
+        score -= weak_count
+
+    return max(
+        score,
+        0
+    )
+
+
+# ============================================================
+# SEVERITY
+# ============================================================
+
+def get_severity(score):
+
+    if score >= 6:
+        return "HIGH"
+
+    if score >= 3:
+        return "MEDIUM"
+
+    if score >= 1:
+        return "LOW"
+
+    return "CLEAN"
+
+
+# ============================================================
+# RESULT CREATION
 # ============================================================
 
 def add_result(
@@ -466,55 +1535,262 @@ def add_result(
     scope,
     startup_type,
     command,
-    executable_path
+    launcher="",
+    arguments=""
 ):
 
-    executable_path = expand_path(
-        executable_path
-    )
+    command = str(
+        command or ""
+    ).strip()
 
-    exists = bool(
-        executable_path
-        and os.path.isfile(
-            executable_path
+    launcher = str(
+        launcher or ""
+    ).strip()
+
+    arguments = str(
+        arguments or ""
+    ).strip()
+
+    # ========================================================
+    # LAUNCHER
+    # ========================================================
+
+    if launcher:
+
+        launcher = resolve_program(
+            launcher
         )
+
+    else:
+
+        launcher = extract_launcher(
+            command
+        )
+
+    # ========================================================
+    # ARGUMENTS
+    # ========================================================
+
+    if (
+        launcher
+        and not arguments
+    ):
+
+        arguments = extract_arguments(
+            command,
+            launcher
+        )
+
+    # ========================================================
+    # TARGET
+    # ========================================================
+
+    target = find_explicit_target(
+        launcher,
+        arguments
     )
 
-    publisher = get_publisher(
-        executable_path
+    # ========================================================
+    # EXISTENCE
+    # ========================================================
+
+    launcher_exists = (
+        file_exists(
+            launcher
+        )
+        if launcher
+        else False
     )
 
-    sha256 = calculate_sha256(
-        executable_path
+    target_exists = (
+        file_exists(
+            target
+        )
+        if target
+        else False
     )
 
-    flags = suspicious_flags(
-        executable_path,
-        exists,
-        publisher,
+    # ========================================================
+    # SIGNATURES
+    # ========================================================
+
+    if launcher_exists:
+
+        launcher_signature = (
+            get_signature_information(
+                launcher
+            )
+        )
+
+    else:
+
+        launcher_signature = {
+            "Status": "N/A",
+            "Publisher": "N/A"
+        }
+
+    if target_exists:
+
+        target_signature = (
+            get_signature_information(
+                target
+            )
+        )
+
+    else:
+
+        target_signature = {
+            "Status": "N/A",
+            "Publisher": "N/A"
+        }
+
+    # ========================================================
+    # HASHES
+    # ========================================================
+
+    launcher_hash = (
+        calculate_sha256(
+            launcher
+        )
+        if launcher_exists
+        else "N/A"
+    )
+
+    target_hash = (
+        calculate_sha256(
+            target
+        )
+        if target_exists
+        else "N/A"
+    )
+
+    # ========================================================
+    # FLAGS
+    # ========================================================
+
+    flags = detect_flags(
+        scope,
+        startup_type,
+        launcher,
+        target,
         command,
-        startup_type
+        launcher_signature,
+        target_signature
     )
+
+    # ========================================================
+    # SCORE
+    # ========================================================
+
+    score = calculate_risk_score(
+        flags,
+        launcher_signature[
+            "Publisher"
+        ],
+        target_signature[
+            "Publisher"
+        ]
+    )
+
+    severity = get_severity(
+        score
+    )
+
+    # ========================================================
+    # SAVE RESULT
+    # ========================================================
 
     results.append(
         {
-            "Name": str(name),
-            "Scope": str(scope),
-            "Startup Type": str(startup_type),
-            "Command": str(command),
-            "Executable Path": executable_path,
-            "Exists": (
-                "YES"
-                if exists
-                else "NO"
-            ),
-            "Publisher": publisher,
-            "SHA-256": sha256,
-            "Flags": (
-                ", ".join(flags)
-                if flags
-                else "None"
-            )
+            "Name":
+                str(name),
+
+            "Scope":
+                str(scope),
+
+            "Startup Type":
+                str(startup_type),
+
+            "Command":
+                command,
+
+            "Arguments":
+                arguments,
+
+            "Launcher":
+                (
+                    launcher
+                    if launcher
+                    else "N/A"
+                ),
+
+            "Launcher Exists":
+                (
+                    "YES"
+                    if launcher_exists
+                    else (
+                        "NO"
+                        if launcher
+                        else "N/A"
+                    )
+                ),
+
+            "Launcher Publisher":
+                launcher_signature[
+                    "Publisher"
+                ],
+
+            "Launcher Signature":
+                launcher_signature[
+                    "Status"
+                ],
+
+            "Launcher SHA-256":
+                launcher_hash,
+
+            "Target":
+                (
+                    target
+                    if target
+                    else "N/A"
+                ),
+
+            "Target Exists":
+                (
+                    "YES"
+                    if target_exists
+                    else (
+                        "NO"
+                        if target
+                        else "N/A"
+                    )
+                ),
+
+            "Target Publisher":
+                target_signature[
+                    "Publisher"
+                ],
+
+            "Target Signature":
+                target_signature[
+                    "Status"
+                ],
+
+            "Target SHA-256":
+                target_hash,
+
+            "Score":
+                score,
+
+            "Severity":
+                severity,
+
+            "Flags":
+                (
+                    ", ".join(flags)
+                    if flags
+                    else "None"
+                )
         }
     )
 
@@ -524,11 +1800,11 @@ def add_result(
 # ============================================================
 
 def scan_startup_folder(
-    folder_path,
+    folder,
     scope
 ):
 
-    path = Path(folder_path)
+    path = Path(folder)
 
     if not path.exists():
         return
@@ -537,37 +1813,72 @@ def scan_startup_folder(
 
         for entry in path.iterdir():
 
-            command = str(entry)
-            executable = str(entry)
+            if not entry.is_file():
+                continue
 
-            if entry.suffix.lower() == ".lnk":
+            # =================================================
+            # SHORTCUT
+            # =================================================
 
-                resolved = resolve_shortcut(
-                    entry
+            if (
+                entry.suffix.lower()
+                == ".lnk"
+            ):
+
+                target, arguments = (
+                    resolve_shortcut(
+                        entry
+                    )
                 )
 
-                if resolved:
-                    executable = resolved
+                if not target:
+                    continue
 
-            add_result(
-                entry.stem,
-                scope,
-                "Startup Folder",
-                command,
-                executable
-            )
+                command = (
+                    f'"{target}"'
+                )
+
+                if arguments:
+
+                    command += (
+                        f" {arguments}"
+                    )
+
+                add_result(
+                    entry.name,
+                    scope,
+                    "Startup Folder",
+                    command,
+                    target,
+                    arguments
+                )
+
+            # =================================================
+            # DIRECT FILE
+            # =================================================
+
+            else:
+
+                add_result(
+                    entry.name,
+                    scope,
+                    "Startup Folder",
+                    str(entry),
+                    str(entry),
+                    ""
+                )
 
     except PermissionError:
 
         print(
             YELLOW
-            + f"[!] Permission denied: {folder_path}"
+            + f"[!] Access denied: {folder}"
             + RESET
         )
 
 
 # ============================================================
-# REGISTRY RUN / RUNONCE
+# REGISTRY
 # ============================================================
 
 def scan_registry_key(
@@ -575,16 +1886,21 @@ def scan_registry_key(
     key_path,
     scope,
     startup_type,
-    access_flags=0
+    view_flag=0
 ):
 
     try:
+
+        access = (
+            winreg.KEY_READ
+            | view_flag
+        )
 
         with winreg.OpenKey(
             hive,
             key_path,
             0,
-            winreg.KEY_READ | access_flags
+            access
         ) as key:
 
             index = 0
@@ -593,23 +1909,18 @@ def scan_registry_key(
 
                 try:
 
-                    name, command, _ = (
+                    name, value, _ = (
                         winreg.EnumValue(
                             key,
                             index
                         )
                     )
 
-                    command = str(command)
-
                     add_result(
                         name,
                         scope,
                         startup_type,
-                        command,
-                        extract_executable(
-                            command
-                        )
+                        str(value)
                     )
 
                     index += 1
@@ -617,16 +1928,17 @@ def scan_registry_key(
                 except OSError:
                     break
 
-    except FileNotFoundError:
-        pass
-
-    except PermissionError:
+    except (
+        FileNotFoundError,
+        PermissionError,
+        OSError
+    ):
         pass
 
 
 def scan_registry():
 
-    user_keys = [
+    locations = [
         (
             r"Software\Microsoft\Windows\CurrentVersion\Run",
             "Registry Run"
@@ -637,147 +1949,41 @@ def scan_registry():
         )
     ]
 
-    machine_keys = [
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            "Registry Run"
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
-            "Registry RunOnce"
-        )
-    ]
+    # Current User
 
-    # Current user
-    for path, startup_type in user_keys:
+    for key, startup_type in locations:
 
         scan_registry_key(
             winreg.HKEY_CURRENT_USER,
-            path,
+            key,
             "Current User",
             startup_type
         )
 
-    # 64-bit machine
-    for path, startup_type in machine_keys:
+    # HKLM 64-bit
+
+    for key, startup_type in locations:
 
         scan_registry_key(
             winreg.HKEY_LOCAL_MACHINE,
-            path,
+            key,
             "All Users",
-            startup_type + " (64-bit)",
+            startup_type
+            + " (64-bit)",
             winreg.KEY_WOW64_64KEY
         )
 
-    # 32-bit machine
-    for path, startup_type in machine_keys:
+    # HKLM 32-bit
+
+    for key, startup_type in locations:
 
         scan_registry_key(
             winreg.HKEY_LOCAL_MACHINE,
-            path,
+            key,
             "All Users",
-            startup_type + " (32-bit)",
+            startup_type
+            + " (32-bit)",
             winreg.KEY_WOW64_32KEY
-        )
-
-
-# ============================================================
-# WINDOWS SERVICES
-# ============================================================
-
-def scan_services():
-
-    command = r"""
-Get-CimInstance Win32_Service |
-Where-Object {
-    $_.StartMode -eq 'Auto' -or
-    $_.StartMode -eq 'Manual'
-} |
-Select-Object Name, DisplayName, StartMode, State, StartName, PathName |
-ConvertTo-Json -Compress
-"""
-
-    output = powershell(
-        command,
-        60
-    )
-
-    if not output:
-        return
-
-    try:
-
-        services = json.loads(
-            output
-        )
-
-    except json.JSONDecodeError:
-        return
-
-    if isinstance(services, dict):
-        services = [services]
-
-    for service in services:
-
-        path_name = (
-            service.get("PathName")
-            or ""
-        )
-
-        executable = extract_executable(
-            path_name
-        )
-
-        service_name = (
-            service.get("Name")
-            or "Unknown"
-        )
-
-        display_name = (
-            service.get("DisplayName")
-            or service_name
-        )
-
-        start_mode = (
-            service.get("StartMode")
-            or "Unknown"
-        )
-
-        state = (
-            service.get("State")
-            or "Unknown"
-        )
-
-        account = (
-            service.get("StartName")
-            or "Unknown"
-        )
-
-        name = (
-            f"{display_name} "
-            f"[{service_name}]"
-        )
-
-        startup_type = (
-            f"Service ({start_mode})"
-        )
-
-        scope = (
-            f"System / All Users"
-        )
-
-        command_display = (
-            f"{path_name} "
-            f"[State={state}; "
-            f"Account={account}]"
-        )
-
-        add_result(
-            name,
-            scope,
-            startup_type,
-            command_display,
-            executable
         )
 
 
@@ -788,25 +1994,36 @@ ConvertTo-Json -Compress
 def scan_scheduled_tasks():
 
     command = r"""
-$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
+$items = @()
 
-$result = foreach ($task in $tasks) {
+foreach ($task in Get-ScheduledTask -ErrorAction SilentlyContinue) {
 
     foreach ($action in $task.Actions) {
 
-        [PSCustomObject]@{
-            TaskName  = $task.TaskName
-            TaskPath  = $task.TaskPath
+        $execute = ''
+        $arguments = ''
+
+        if ($null -ne $action.Execute) {
+            $execute = [string]$action.Execute
+        }
+
+        if ($null -ne $action.Arguments) {
+            $arguments = [string]$action.Arguments
+        }
+
+        $items += [PSCustomObject]@{
+            TaskName  = [string]$task.TaskName
+            TaskPath  = [string]$task.TaskPath
             State     = [string]$task.State
             UserId    = [string]$task.Principal.UserId
             RunLevel  = [string]$task.Principal.RunLevel
-            Execute   = [string]$action.Execute
-            Arguments = [string]$action.Arguments
+            Execute   = $execute
+            Arguments = $arguments
         }
     }
 }
 
-$result | ConvertTo-Json -Compress
+$items | ConvertTo-Json -Compress -Depth 4
 """
 
     output = powershell(
@@ -826,62 +2043,66 @@ $result | ConvertTo-Json -Compress
     except json.JSONDecodeError:
         return
 
-    if isinstance(tasks, dict):
+    if isinstance(
+        tasks,
+        dict
+    ):
         tasks = [tasks]
 
-    current_user = os.environ.get(
+    username = os.environ.get(
         "USERNAME",
         ""
     ).lower()
 
     for task in tasks:
 
-        execute = (
-            task.get("Execute")
+        execute = str(
+            task.get(
+                "Execute",
+                ""
+            )
             or ""
-        )
-
-        arguments = (
-            task.get("Arguments")
-            or ""
-        )
-
-        user_id = (
-            task.get("UserId")
-            or ""
-        )
-
-        command_line = (
-            f'"{execute}" {arguments}'
         ).strip()
 
-        task_name = (
-            task.get("TaskName")
-            or "Unknown"
+        arguments = str(
+            task.get(
+                "Arguments",
+                ""
+            )
+            or ""
+        ).strip()
+
+        user_id = str(
+            task.get(
+                "UserId",
+                ""
+            )
+            or ""
         )
 
-        task_path = (
-            task.get("TaskPath")
-            or "\\"
+        task_name = str(
+            task.get(
+                "TaskName",
+                "Unknown"
+            )
         )
 
-        state = (
-            task.get("State")
-            or "Unknown"
+        task_path = str(
+            task.get(
+                "TaskPath",
+                "\\"
+            )
         )
 
-        run_level = (
-            task.get("RunLevel")
-            or "Unknown"
-        )
+        # Do not manufacture a launcher from metadata
+        # when the task does not have an executable action.
 
-        # Scheduled tasks aren't always cleanly
-        # Current User vs All Users, but identify
-        # obvious current-user ownership.
+        if not execute:
+            continue
 
         if (
-            current_user
-            and current_user
+            username
+            and username
             in user_id.lower()
         ):
 
@@ -891,71 +2112,125 @@ $result | ConvertTo-Json -Compress
 
             scope = "System / All Users"
 
-        name = (
-            f"{task_path}{task_name}"
+        command_line = (
+            f'"{execute}"'
         )
 
-        command_display = (
-            f"{command_line} "
-            f"[User={user_id}; "
-            f"State={state}; "
-            f"RunLevel={run_level}]"
-        )
+        if arguments:
+
+            command_line += (
+                f" {arguments}"
+            )
 
         add_result(
-            name,
+            f"{task_path}{task_name}",
             scope,
             "Scheduled Task",
-            command_display,
-            expand_path(execute)
+            command_line,
+            execute,
+            arguments
         )
 
 
 # ============================================================
-# FLAG SEVERITY
+# AUTOMATIC SERVICES
 # ============================================================
 
-HIGH_FLAGS = {
-    "TEMP_PATH",
-    "DOWNLOADS_PATH",
-    "ENCODED_COMMAND",
-    "HIDDEN_WINDOW"
-}
+def scan_services():
 
-MEDIUM_FLAGS = {
-    "MISSING_FILE",
-    "NETWORK_PATH",
-    "INTERPRETER",
-    "SCRIPT"
-}
+    command = r"""
+Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.StartMode -eq 'Auto'
+} |
+Select-Object Name,DisplayName,StartMode,State,StartName,PathName |
+ConvertTo-Json -Compress -Depth 4
+"""
 
-LOW_FLAGS = {
-    "APPDATA",
-    "LOCAL_APPDATA",
-    "UNSIGNED"
-}
+    output = powershell(
+        command,
+        60
+    )
+
+    if not output:
+        return
+
+    try:
+
+        services = json.loads(
+            output
+        )
+
+    except json.JSONDecodeError:
+        return
+
+    if isinstance(
+        services,
+        dict
+    ):
+        services = [services]
+
+    for service in services:
+
+        service_name = str(
+            service.get(
+                "Name",
+                "Unknown"
+            )
+        )
+
+        display_name = str(
+            service.get(
+                "DisplayName",
+                service_name
+            )
+        )
+
+        path_name = str(
+            service.get(
+                "PathName",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if not path_name:
+            continue
+
+        add_result(
+            (
+                f"{display_name} "
+                f"[{service_name}]"
+            ),
+            "System / All Users",
+            "Service (Auto)",
+            path_name
+        )
 
 
-def get_severity(flags_string):
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
 
-    if flags_string == "None":
-        return "CLEAN"
+def shorten(
+    value,
+    length
+):
 
-    flags = {
-        flag.strip()
-        for flag in flags_string.split(",")
-    }
+    value = str(value)
 
-    if flags & HIGH_FLAGS:
-        return "HIGH"
+    if len(value) <= length:
+        return value
 
-    if flags & MEDIUM_FLAGS:
-        return "MEDIUM"
-
-    return "LOW"
+    return (
+        value[:length - 3]
+        + "..."
+    )
 
 
-def severity_color(severity):
+def severity_color(
+    severity
+):
 
     if severity == "HIGH":
         return RED
@@ -970,7 +2245,7 @@ def severity_color(severity):
 
 
 # ============================================================
-# CONSOLE TABLE
+# RESULTS TABLE
 # ============================================================
 
 def print_table():
@@ -978,17 +2253,17 @@ def print_table():
     if not results:
 
         print(
-            "\nNo autostart entries found."
+            "\nNo persistence entries found."
         )
 
         return
 
-    print("\n")
+    print()
 
     print(
         BOLD
         + CYAN
-        + "=" * 190
+        + "=" * 174
         + RESET
     )
 
@@ -1002,19 +2277,19 @@ def print_table():
     print(
         BOLD
         + CYAN
-        + "=" * 190
+        + "=" * 174
         + RESET
     )
 
     headers = [
-        ("Name", 27),
-        ("Scope", 20),
-        ("Startup Type", 25),
-        ("Executable Path", 43),
-        ("Exists", 7),
-        ("Publisher", 27),
-        ("SHA-256", 15),
-        ("Flags", 30)
+        ("Severity", 9),
+        ("Score", 6),
+        ("Name", 31),
+        ("Scope", 18),
+        ("Startup Type", 23),
+        ("Launcher", 38),
+        ("Publisher", 25),
+        ("Flags", 40)
     ]
 
     header_line = ""
@@ -1031,141 +2306,59 @@ def print_table():
         + RESET
     )
 
-    print("-" * 190)
+    print(
+        "-" * 174
+    )
 
     for item in results:
 
-        severity = get_severity(
-            item["Flags"]
-        )
+        values = {
+            "Severity":
+                item["Severity"],
 
-        color = severity_color(
-            severity
-        )
+            "Score":
+                str(item["Score"]),
+
+            "Name":
+                item["Name"],
+
+            "Scope":
+                item["Scope"],
+
+            "Startup Type":
+                item["Startup Type"],
+
+            "Launcher":
+                item["Launcher"],
+
+            "Publisher":
+                item[
+                    "Launcher Publisher"
+                ],
+
+            "Flags":
+                item["Flags"]
+        }
 
         line = ""
 
         for header, width in headers:
 
-            value = shorten(
-                item[header],
-                width
-            )
-
             line += (
-                f"{value:<{width}} "
+                f"{shorten(values[header], width):<{width}} "
             )
 
         print(
-            color
+            severity_color(
+                item["Severity"]
+            )
             + line
             + RESET
         )
 
-    print("=" * 190)
-
-
-# ============================================================
-# FLAGGED DETAILS
-# ============================================================
-
-def print_flagged_details():
-
-    flagged = [
-        item
-        for item in results
-        if item["Flags"] != "None"
-    ]
-
-    if not flagged:
-        return
-
     print(
-        "\n\n"
-        + BOLD
-        + "FLAGGED ENTRY DETAILS"
-        + RESET
+        "=" * 174
     )
-
-    print("=" * 90)
-
-    flagged.sort(
-        key=lambda item: {
-            "HIGH": 0,
-            "MEDIUM": 1,
-            "LOW": 2
-        }.get(
-            get_severity(
-                item["Flags"]
-            ),
-            3
-        )
-    )
-
-    for number, item in enumerate(
-        flagged,
-        start=1
-    ):
-
-        severity = get_severity(
-            item["Flags"]
-        )
-
-        color = severity_color(
-            severity
-        )
-
-        print(
-            f"\n{color}"
-            f"[{number}] "
-            f"{severity}: "
-            f"{item['Name']}"
-            f"{RESET}"
-        )
-
-        print("-" * 90)
-
-        print(
-            f"Scope           : "
-            f"{item['Scope']}"
-        )
-
-        print(
-            f"Startup Type    : "
-            f"{item['Startup Type']}"
-        )
-
-        print(
-            f"Command         : "
-            f"{item['Command']}"
-        )
-
-        print(
-            f"Executable Path : "
-            f"{item['Executable Path']}"
-        )
-
-        print(
-            f"Exists          : "
-            f"{item['Exists']}"
-        )
-
-        print(
-            f"Publisher       : "
-            f"{item['Publisher']}"
-        )
-
-        print(
-            f"SHA-256         : "
-            f"{item['SHA-256']}"
-        )
-
-        print(
-            f"Flags           : "
-            f"{color}"
-            f"{item['Flags']}"
-            f"{RESET}"
-        )
 
 
 # ============================================================
@@ -1174,38 +2367,30 @@ def print_flagged_details():
 
 def print_summary():
 
-    high = 0
-    medium = 0
-    low = 0
-    clean = 0
+    counts = {
+        "HIGH": 0,
+        "MEDIUM": 0,
+        "LOW": 0,
+        "CLEAN": 0
+    }
 
     for item in results:
 
-        severity = get_severity(
-            item["Flags"]
-        )
-
-        if severity == "HIGH":
-            high += 1
-
-        elif severity == "MEDIUM":
-            medium += 1
-
-        elif severity == "LOW":
-            low += 1
-
-        else:
-            clean += 1
+        counts[
+            item["Severity"]
+        ] += 1
 
     print(
-        "\n\n"
+        "\n"
         + BOLD
         + CYAN
         + "SCAN SUMMARY"
         + RESET
     )
 
-    print("=" * 60)
+    print(
+        "=" * 60
+    )
 
     print(
         f"Total entries      : "
@@ -1214,61 +2399,302 @@ def print_summary():
 
     print(
         RED
-        + f"High priority      : {high}"
+        + f"High priority      : "
+        f"{counts['HIGH']}"
         + RESET
     )
 
     print(
         YELLOW
-        + f"Medium priority    : {medium}"
+        + f"Medium priority    : "
+        f"{counts['MEDIUM']}"
         + RESET
     )
 
     print(
         MAGENTA
-        + f"Low priority       : {low}"
+        + f"Low priority       : "
+        f"{counts['LOW']}"
         + RESET
     )
 
     print(
         GREEN
-        + f"No heuristic flags : {clean}"
+        + f"No heuristic flags : "
+        f"{counts['CLEAN']}"
         + RESET
     )
 
     print()
 
     print(
-        RED
-        + "HIGH"
-        + RESET
-        + "   = Stronger review indicators"
+        "Risk thresholds:"
     )
 
     print(
-        YELLOW
-        + "MEDIUM"
-        + RESET
-        + " = Requires investigation"
+        "  CLEAN  = 0"
     )
 
     print(
-        MAGENTA
-        + "LOW"
-        + RESET
-        + "    = Weak indicator / often legitimate"
+        "  LOW    = 1-2"
     )
 
     print(
-        GREEN
-        + "GREEN"
-        + RESET
-        + "  = No current heuristic triggered"
+        "  MEDIUM = 3-5"
     )
 
     print(
-        "\nA flag does NOT mean that an entry is malicious."
+        "  HIGH   = 6+"
     )
+
+    print()
+
+    print(
+        "Flags are heuristic indicators, not malware verdicts."
+    )
+
+
+# ============================================================
+# HASH ANALYSIS
+# ============================================================
+
+def valid_sha256(value):
+
+    if not isinstance(
+        value,
+        str
+    ):
+        return False
+
+    return bool(
+        re.fullmatch(
+            r"[0-9a-fA-F]{64}",
+            value
+        )
+    )
+
+
+def print_hash_analysis():
+
+    launcher_hashes = 0
+    target_hashes = 0
+    unavailable = 0
+    errors = 0
+
+    for item in results:
+
+        launcher_hash = item[
+            "Launcher SHA-256"
+        ]
+
+        target_hash = item[
+            "Target SHA-256"
+        ]
+
+        if valid_sha256(
+            launcher_hash
+        ):
+
+            launcher_hashes += 1
+
+        elif launcher_hash in (
+            "ACCESS_DENIED",
+            "ERROR"
+        ):
+
+            errors += 1
+
+        elif (
+            item["Launcher"]
+            != "N/A"
+        ):
+
+            unavailable += 1
+
+        if valid_sha256(
+            target_hash
+        ):
+
+            target_hashes += 1
+
+    print(
+        "\n"
+        + BOLD
+        + CYAN
+        + "HASH ANALYSIS"
+        + RESET
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"Launcher hashes calculated : "
+        f"{launcher_hashes}"
+    )
+
+    print(
+        f"Target hashes calculated   : "
+        f"{target_hashes}"
+    )
+
+    print(
+        f"Unavailable paths          : "
+        f"{unavailable}"
+    )
+
+    print(
+        f"Hash/access errors         : "
+        f"{errors}"
+    )
+
+
+# ============================================================
+# FLAGGED ENTRY DETAILS
+# ============================================================
+
+def print_flagged_details():
+
+    flagged = [
+        item
+        for item in results
+        if item["Severity"]
+        != "CLEAN"
+    ]
+
+    if not flagged:
+
+        print(
+            "\n"
+            + GREEN
+            + "No entries triggered risk flags."
+            + RESET
+        )
+
+        return
+
+    print(
+        "\n"
+        + BOLD
+        + CYAN
+        + "FLAGGED ENTRY DETAILS"
+        + RESET
+    )
+
+    print(
+        "=" * 100
+    )
+
+    for number, item in enumerate(
+        flagged,
+        1
+    ):
+
+        color = severity_color(
+            item["Severity"]
+        )
+
+        print(
+            f"\n{color}"
+            f"[{number}] "
+            f"{item['Severity']} "
+            f"(Score {item['Score']}) - "
+            f"{item['Name']}"
+            f"{RESET}"
+        )
+
+        print(
+            "-" * 100
+        )
+
+        print(
+            f"Scope              : "
+            f"{item['Scope']}"
+        )
+
+        print(
+            f"Startup Type       : "
+            f"{item['Startup Type']}"
+        )
+
+        print(
+            f"Command            : "
+            f"{item['Command']}"
+        )
+
+        print(
+            f"Arguments          : "
+            f"{item['Arguments']}"
+        )
+
+        print()
+
+        print(
+            f"Launcher           : "
+            f"{item['Launcher']}"
+        )
+
+        print(
+            f"Launcher Exists    : "
+            f"{item['Launcher Exists']}"
+        )
+
+        print(
+            f"Launcher Publisher : "
+            f"{item['Launcher Publisher']}"
+        )
+
+        print(
+            f"Launcher Signature : "
+            f"{item['Launcher Signature']}"
+        )
+
+        print(
+            f"Launcher SHA-256   : "
+            f"{item['Launcher SHA-256']}"
+        )
+
+        print()
+
+        print(
+            f"Target             : "
+            f"{item['Target']}"
+        )
+
+        print(
+            f"Target Exists      : "
+            f"{item['Target Exists']}"
+        )
+
+        print(
+            f"Target Publisher   : "
+            f"{item['Target Publisher']}"
+        )
+
+        print(
+            f"Target Signature   : "
+            f"{item['Target Signature']}"
+        )
+
+        print(
+            f"Target SHA-256     : "
+            f"{item['Target SHA-256']}"
+        )
+
+        print()
+
+        print(
+            f"Risk Score         : "
+            f"{item['Score']}"
+        )
+
+        print(
+            f"Flags              : "
+            f"{color}"
+            f"{item['Flags']}"
+            f"{RESET}"
+        )
 
 
 # ============================================================
@@ -1289,7 +2715,7 @@ def main():
     print(
         BOLD
         + CYAN
-        + " WINDOWS PERSISTENCE / AUTOSTART SCANNER"
+        + " WINDOWS PERSISTENCE SCANNER"
         + RESET
     )
 
@@ -1300,9 +2726,9 @@ def main():
         + RESET
     )
 
-    # --------------------------------------------------------
-    # Startup folders
-    # --------------------------------------------------------
+    # ========================================================
+    # STARTUP FOLDERS
+    # ========================================================
 
     print(
         "\n[*] Scanning Current User Startup folder..."
@@ -1348,19 +2774,19 @@ def main():
             "All Users"
         )
 
-    # --------------------------------------------------------
-    # Registry
-    # --------------------------------------------------------
+    # ========================================================
+    # REGISTRY
+    # ========================================================
 
     print(
-        "[*] Scanning Registry Run/RunOnce..."
+        "[*] Scanning Registry Run / RunOnce..."
     )
 
     scan_registry()
 
-    # --------------------------------------------------------
-    # Scheduled tasks
-    # --------------------------------------------------------
+    # ========================================================
+    # SCHEDULED TASKS
+    # ========================================================
 
     print(
         "[*] Scanning Scheduled Tasks..."
@@ -1368,49 +2794,55 @@ def main():
 
     scan_scheduled_tasks()
 
-    # --------------------------------------------------------
-    # Services
-    # --------------------------------------------------------
+    # ========================================================
+    # SERVICES
+    # ========================================================
 
     print(
-        "[*] Scanning Windows Services..."
+        "[*] Scanning Automatic Windows Services..."
     )
 
     scan_services()
 
-    # --------------------------------------------------------
-    # Sort
-    # --------------------------------------------------------
+    # ========================================================
+    # RESULTS
+    # ========================================================
 
     print(
-        "[*] Analyzing signatures, paths and SHA-256 hashes..."
+        "[*] Resolving files, signatures, and SHA-256 hashes..."
     )
+
+    priority = {
+        "HIGH": 0,
+        "MEDIUM": 1,
+        "LOW": 2,
+        "CLEAN": 3
+    }
 
     results.sort(
         key=lambda item: (
-            {
-                "HIGH": 0,
-                "MEDIUM": 1,
-                "LOW": 2,
-                "CLEAN": 3
-            }.get(
-                get_severity(
-                    item["Flags"]
-                ),
+            priority.get(
+                item["Severity"],
                 4
             ),
-            item["Startup Type"],
-            item["Name"].lower()
+
+            -item["Score"],
+
+            item[
+                "Startup Type"
+            ].lower(),
+
+            item[
+                "Name"
+            ].lower()
         )
     )
-
-    # --------------------------------------------------------
-    # Results
-    # --------------------------------------------------------
 
     print_table()
 
     print_summary()
+
+    print_hash_analysis()
 
     print_flagged_details()
 
