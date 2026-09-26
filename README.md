@@ -36,13 +36,13 @@ Add a screenshot of the scanner here:
 
 ```text
 screenshots/
-└── scanner-output.png
+└── windows-persistence-scanner-results.png
 ```
 
 Example:
 
 ```markdown
-![Windows Persistence Scanner](screenshots/scanner-output.png)
+![Windows Persistence Scanner](screenshots/windows-persistence-scanner-results.png)
 ```
 
 ---
@@ -495,7 +495,7 @@ windows-persistence-scanner/
 ├── LICENSE
 │
 └── screenshots/
-    └── scanner-output.png
+    └── windows-persistence-scanner-results.png
 ```
 
 ---
