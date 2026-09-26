@@ -32,9 +32,9 @@ The tool is **read-only** and does not disable, delete, or modify discovered per
 
 ## Screenshot
 
-```markdown
+
 ![Windows Persistence Scanner](screenshots/windows-persistence-scanner-results.png)
-```
+
 
 ---
 
